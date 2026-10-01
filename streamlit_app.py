@@ -2,12 +2,22 @@ import os
 import numpy as np
 import streamlit as st
 import tensorflow as tf
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 from PIL import Image, ImageOps
+from lime import lime_image
+from skimage.segmentation import mark_boundaries
 
-st.title("Flower Classification Model")
+st.set_page_config(page_title="Flower Classification with XAI", page_icon="🌸", layout="wide")
+st.title("🌸 Flower Classification with Explainable AI (Grad-CAM & LIME)")
+st.write("Upload a flower image to get the prediction and see which parts of the image the model used.")
+
+IMAGE_SIZE = (224, 224)
+SEED = 42
 
 # labels.txt থাকলে সেটাই ব্যবহার হবে (repo-তে model.h5-এর পাশে রাখুন)।
-# না থাকলে নিচের বর্ণানুক্রমিক তালিকা (১৯টি নাম) ব্যবহার হবে।
+# না থাকলে নিচের বর্ণানুক্রমিক তালিকা ব্যবহার হবে।
 FALLBACK_CLASS_NAMES = sorted([
     'astilbe', 'bellflower', 'black_eyed_susan', 'calendula', 'california_poppy',
     'carnation', 'common_daisy', 'coreopsis', 'daffodil', 'dandelion',
@@ -19,42 +29,153 @@ FALLBACK_CLASS_NAMES = sorted([
 @st.cache_resource
 def load_assets():
     model = tf.keras.models.load_model("model.h5", compile=False)
+
     if os.path.exists("labels.txt"):
         with open("labels.txt") as f:
-            names = [line.strip() for line in f if line.strip()]
+            class_names = [line.strip() for line in f if line.strip()]
     else:
-        names = FALLBACK_CLASS_NAMES
-    return model, names
+        class_names = FALLBACK_CLASS_NAMES
+
+    # Grad-CAM: মডেলকে দুই ভাগ করা হয়েছে
+    # (ছবি -> শেষ conv feature map) এবং (feature map -> ক্লাস স্কোর)
+    base = next(l for l in model.layers if isinstance(l, tf.keras.Model))   # MobileNetV2
+    head_layers = model.layers[model.layers.index(base) + 1:]
+    feature_extractor = tf.keras.Model(base.inputs, base.get_layer("out_relu").output)
+    return model, class_names, feature_extractor, head_layers
 
 
-model, class_names = load_assets()
+model, CLASS_NAMES, feature_extractor, head_layers = load_assets()
 
-# মডেলের আউটপুট সংখ্যা আর নামের সংখ্যা না মিললে থামিয়ে দেখানো
-if model.output_shape[-1] != len(class_names):
-    st.error(f"ক্লাস সংখ্যা মেলেনি: মডেলে {model.output_shape[-1]}টি, নামের তালিকায় {len(class_names)}টি।")
+if model.output_shape[-1] != len(CLASS_NAMES):
+    st.error(f"ক্লাস সংখ্যা মেলেনি: মডেলে {model.output_shape[-1]}টি, নামের তালিকায় {len(CLASS_NAMES)}টি।")
     st.stop()
 
-uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "png", "jpeg"])
+
+def pretty(name):
+    return name.replace("_", " ").title()
+
+
+def preprocess(pil_image):
+    """ট্রেনিংয়ের মতোই: RGB, 224x224, পিক্সেল ÷ 255 (মান 0..1)।"""
+    img = ImageOps.exif_transpose(pil_image).convert("RGB")
+    resized = img.resize(IMAGE_SIZE)
+    arr = np.asarray(resized, dtype=np.float32) / 255.0
+    return resized, arr
+
+
+# ---------------- Grad-CAM ----------------
+def gradcam_heatmap(img_array, class_idx):
+    x = tf.convert_to_tensor(img_array[None, ...], dtype=tf.float32)
+    with tf.GradientTape() as tape:
+        conv_out = feature_extractor(x, training=False)
+        tape.watch(conv_out)
+        h = conv_out
+        for layer in head_layers:
+            h = layer(h)
+        score = h[:, class_idx]
+    grads = tape.gradient(score, conv_out)
+    weights = tf.reduce_mean(grads, axis=(0, 1, 2))                 # প্রতিটি চ্যানেলের গুরুত্ব
+    heatmap = tf.reduce_sum(conv_out[0] * weights, axis=-1)         # চ্যানেলের ভারযুক্ত যোগফল
+    heatmap = tf.maximum(heatmap, 0)                                # শুধু ইতিবাচক প্রভাব
+    heatmap = heatmap / (tf.reduce_max(heatmap) + 1e-10)
+    return heatmap.numpy()
+
+
+def gradcam_images(img_array, heatmap, alpha=0.4):
+    """(রঙিন হিটম্যাপ, ছবির উপর overlay): দুটিই float RGB, মান 0..1।"""
+    big = tf.image.resize(heatmap[..., None], IMAGE_SIZE, method="bilinear").numpy()[..., 0]
+    color = plt.get_cmap("jet")(np.clip(big, 0, 1))[..., :3]
+    overlay = (1 - alpha) * img_array + alpha * color
+    return np.clip(color, 0, 1), np.clip(overlay, 0, 1)
+
+
+# ---------------- LIME ----------------
+def lime_predict_fn(images):
+    images = np.asarray(images, dtype=np.float32)
+    outs = []
+    for i in range(0, len(images), 32):
+        outs.append(model(images[i:i + 32], training=False).numpy())
+    return np.concatenate(outs, axis=0)
+
+
+def compute_lime(img_array, class_idx, num_samples, num_regions):
+    explainer = lime_image.LimeImageExplainer()
+    explanation = explainer.explain_instance(
+        img_array.astype("double"),
+        lime_predict_fn,
+        labels=(class_idx,),
+        top_labels=None,
+        hide_color=0,
+        num_samples=num_samples,
+        batch_size=32,
+        random_seed=SEED,
+    )
+    temp, mask = explanation.get_image_and_mask(
+        class_idx, positive_only=True, num_features=num_regions, hide_rest=False)
+    boundaries = np.clip(mark_boundaries(temp, mask), 0, 1)
+
+    temp_only, _ = explanation.get_image_and_mask(
+        class_idx, positive_only=True, num_features=num_regions, hide_rest=True)
+    return boundaries, np.clip(temp_only, 0, 1)
+
+
+# ---- UI ----
+st.sidebar.header("LIME settings")
+lime_samples = st.sidebar.slider("Samples (more = more stable, slower)", 100, 1000, 300, step=100)
+lime_regions = st.sidebar.slider("Number of important regions", 3, 10, 5)
+
+uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "jpeg", "png"])
 
 if uploaded_file is not None:
-    image = Image.open(uploaded_file)
-    image = ImageOps.exif_transpose(image).convert("RGB")   # PNG alpha / grayscale / ঘোরানো ছবির সমস্যা ঠিক করে
-    st.image(image, caption="Uploaded Image", use_container_width=True)
+    resized_img, img_array = preprocess(Image.open(uploaded_file))
 
-    # Preprocess: ট্রেনিংয়ের মতোই 224x224, পিক্সেল ÷ 255 (মান 0..1)
-    img = image.resize((224, 224))
-    img_array = np.asarray(img, dtype=np.float32) / 255.0
-    img_array = np.expand_dims(img_array, axis=0)
+    probs = model.predict(img_array[None, ...], verbose=0)[0]
+    pred_index = int(np.argmax(probs))
 
-    predictions = model.predict(img_array, verbose=0)[0]
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("Uploaded Image")
+        st.image(resized_img, use_container_width=True)
+    with col2:
+        st.subheader("Prediction")
+        st.success(f"**{pretty(CLASS_NAMES[pred_index])}**")
+        st.info(f"Confidence: {100 * probs[pred_index]:.2f}%")
+        st.markdown("**Top 3**")
+        for i in np.argsort(probs)[::-1][:3]:
+            st.write(f"- {pretty(CLASS_NAMES[i])}: {100 * probs[i]:.1f}%")
 
-    idx = int(np.argmax(predictions))
-    predicted_class = class_names[idx].replace("_", " ").title()
-    confidence = float(predictions[idx]) * 100
+    st.divider()
+    st.subheader("Explainable AI")
+    tab_gradcam, tab_lime = st.tabs(["Grad-CAM", "LIME"])
 
-    st.write(f"### Prediction: {predicted_class}")
-    st.write(f"Confidence: {confidence:.2f}%")
+    with tab_gradcam:
+        try:
+            heatmap = gradcam_heatmap(img_array, pred_index)
+            color, overlay = gradcam_images(img_array, heatmap)
+            c1, c2 = st.columns(2)
+            c1.image(color, caption="Grad-CAM Heatmap", use_container_width=True)
+            c2.image(overlay, caption="Grad-CAM Overlay", use_container_width=True)
+            st.caption("লাল/হলুদ অঞ্চলে মডেল সবচেয়ে বেশি গুরুত্ব দিয়েছে, নীল অঞ্চলে কম।")
+        except Exception as e:
+            st.warning(f"Grad-CAM তৈরি করতে সমস্যা হয়েছে: {e}")
 
-    st.write("Top 3:")
-    for i in np.argsort(predictions)[::-1][:3]:
-        st.write(f"- {class_names[i].replace('_', ' ').title()}: {predictions[i] * 100:.1f}%")
+    with tab_lime:
+        st.write("LIME ছবিকে ছোট ছোট অংশে ভেঙে দেখে কোন অংশগুলো পূর্বাভাসের পক্ষে সবচেয়ে বেশি কাজ করেছে। "
+                 "এতে কিছু সময় লাগে (সার্ভারে সাধারণত ১০–৬০ সেকেন্ড)।")
+        key = (uploaded_file.name, uploaded_file.size, lime_samples, lime_regions)
+
+        if st.button("Generate LIME explanation"):
+            try:
+                with st.spinner("LIME explanation তৈরি হচ্ছে..."):
+                    result = compute_lime(img_array, pred_index, lime_samples, lime_regions)
+                st.session_state["lime_result"] = (key, result)
+            except Exception as e:
+                st.warning(f"LIME তৈরি করতে সমস্যা হয়েছে: {e}")
+
+        saved = st.session_state.get("lime_result")
+        if saved is not None and saved[0] == key:
+            boundaries, only_regions = saved[1]
+            c1, c2 = st.columns(2)
+            c1.image(boundaries, caption=f"LIME: top {lime_regions} regions (boundaries)", use_container_width=True)
+            c2.image(only_regions, caption="LIME: important regions only", use_container_width=True)
+            st.caption("চিহ্নিত অংশগুলো সেই অংশ, যেগুলো এই ফুলের পূর্বাভাসকে সবচেয়ে বেশি সমর্থন করেছে।")
