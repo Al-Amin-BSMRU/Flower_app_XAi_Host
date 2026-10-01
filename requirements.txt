@@ -1,4 +1,4 @@
-tensorflow
-pillow
-numpy
 streamlit
+tensorflow-cpu
+numpy
+pillow
