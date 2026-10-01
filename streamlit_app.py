@@ -1,3 +1,4 @@
+import gc  # RAM মেমরি পরিষ্কার করার জন্য
 import os
 import numpy as np
 import streamlit as st
@@ -16,8 +17,6 @@ st.write("Upload a flower image to get the prediction and see which parts of the
 IMAGE_SIZE = (224, 224)
 SEED = 42
 
-# labels.txt থাকলে সেটাই ব্যবহার হবে (repo-তে model.h5-এর পাশে রাখুন)।
-# না থাকলে নিচের বর্ণানুক্রমিক তালিকা ব্যবহার হবে।
 FALLBACK_CLASS_NAMES = sorted([
     'astilbe', 'bellflower', 'black_eyed_susan', 'calendula', 'california_poppy',
     'carnation', 'common_daisy', 'coreopsis', 'daffodil', 'dandelion',
@@ -36,9 +35,7 @@ def load_assets():
     else:
         class_names = FALLBACK_CLASS_NAMES
 
-    # Grad-CAM: মডেলকে দুই ভাগ করা হয়েছে
-    # (ছবি -> শেষ conv feature map) এবং (feature map -> ক্লাস স্কোর)
-    base = next(l for l in model.layers if isinstance(l, tf.keras.Model))   # MobileNetV2
+    base = next(l for l in model.layers if isinstance(l, tf.keras.Model))
     head_layers = model.layers[model.layers.index(base) + 1:]
     feature_extractor = tf.keras.Model(base.inputs, base.get_layer("out_relu").output)
     return model, class_names, feature_extractor, head_layers
@@ -56,7 +53,6 @@ def pretty(name):
 
 
 def preprocess(pil_image):
-    """ট্রেনিংয়ের মতোই: RGB, 224x224, পিক্সেল ÷ 255 (মান 0..1)।"""
     img = ImageOps.exif_transpose(pil_image).convert("RGB")
     resized = img.resize(IMAGE_SIZE)
     arr = np.asarray(resized, dtype=np.float32) / 255.0
@@ -74,27 +70,27 @@ def gradcam_heatmap(img_array, class_idx):
             h = layer(h)
         score = h[:, class_idx]
     grads = tape.gradient(score, conv_out)
-    weights = tf.reduce_mean(grads, axis=(0, 1, 2))                 # প্রতিটি চ্যানেলের গুরুত্ব
-    heatmap = tf.reduce_sum(conv_out[0] * weights, axis=-1)         # চ্যানেলের ভারযুক্ত যোগফল
-    heatmap = tf.maximum(heatmap, 0)                                # শুধু ইতিবাচক প্রভাব
+    weights = tf.reduce_mean(grads, axis=(0, 1, 2))
+    heatmap = tf.reduce_sum(conv_out[0] * weights, axis=-1)
+    heatmap = tf.maximum(heatmap, 0)
     heatmap = heatmap / (tf.reduce_max(heatmap) + 1e-10)
     return heatmap.numpy()
 
 
 def gradcam_images(img_array, heatmap, alpha=0.4):
-    """(রঙিন হিটম্যাপ, ছবির উপর overlay): দুটিই float RGB, মান 0..1।"""
     big = tf.image.resize(heatmap[..., None], IMAGE_SIZE, method="bilinear").numpy()[..., 0]
     color = plt.get_cmap("jet")(np.clip(big, 0, 1))[..., :3]
     overlay = (1 - alpha) * img_array + alpha * color
     return np.clip(color, 0, 1), np.clip(overlay, 0, 1)
 
 
-# ---------------- LIME ----------------
+# ---------------- LIME (Optimized for RAM) ----------------
 def lime_predict_fn(images):
     images = np.asarray(images, dtype=np.float32)
     outs = []
-    for i in range(0, len(images), 32):
-        outs.append(model(images[i:i + 32], training=False).numpy())
+    # Batch size কমিয়ে ৮ করা হয়েছে RAM প্রসেস হালকা রাখতে
+    for i in range(0, len(images), 8):
+        outs.append(model(images[i:i + 8], training=False).numpy())
     return np.concatenate(outs, axis=0)
 
 
@@ -107,7 +103,7 @@ def compute_lime(img_array, class_idx, num_samples, num_regions):
         top_labels=None,
         hide_color=0,
         num_samples=num_samples,
-        batch_size=32,
+        batch_size=8,  # ৩২ থেকে কমিয়ে ৮ করা হয়েছে
         random_seed=SEED,
     )
     temp, mask = explanation.get_image_and_mask(
@@ -116,12 +112,18 @@ def compute_lime(img_array, class_idx, num_samples, num_regions):
 
     temp_only, _ = explanation.get_image_and_mask(
         class_idx, positive_only=True, num_features=num_regions, hide_rest=True)
+    
+    # প্রসেসিং শেষে মেমরি পরিষ্কার করা
+    del explainer, explanation
+    gc.collect()
+
     return boundaries, np.clip(temp_only, 0, 1)
 
 
 # ---- UI ----
 st.sidebar.header("LIME settings")
-lime_samples = st.sidebar.slider("Samples (more = more stable, slower)", 100, 1000, 300, step=100)
+# স্যাম্পল ১০০ থেকে ১০০০ এর বদলে ৩০ থেকে ১৫০ করা হয়েছে যাতে সার্ভার ক্র্যাশ না করে
+lime_samples = st.sidebar.slider("Samples (fewer = faster & prevents crash)", 30, 150, 60, step=10)
 lime_regions = st.sidebar.slider("Number of important regions", 3, 10, 5)
 
 uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "jpeg", "png"])
@@ -161,7 +163,7 @@ if uploaded_file is not None:
 
     with tab_lime:
         st.write("LIME ছবিকে ছোট ছোট অংশে ভেঙে দেখে কোন অংশগুলো পূর্বাভাসের পক্ষে সবচেয়ে বেশি কাজ করেছে। "
-                 "এতে কিছু সময় লাগে (সার্ভারে সাধারণত ১০–৬০ সেকেন্ড)।")
+                 "এতে কিছু সময় লাগে (সার্ভারে সাধারণত ১০–৪০ সেকেন্ড)।")
         key = (uploaded_file.name, uploaded_file.size, lime_samples, lime_regions)
 
         if st.button("Generate LIME explanation"):
