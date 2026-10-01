@@ -2,3 +2,6 @@ streamlit
 tensorflow-cpu
 numpy
 pillow
+matplotlib
+lime
+scikit-image
