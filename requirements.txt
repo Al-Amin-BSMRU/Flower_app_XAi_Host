@@ -1,7 +1,9 @@
-streamlit
+fastapi
+uvicorn
 tensorflow-cpu
-numpy
 pillow
+numpy
 matplotlib
-lime
 scikit-image
+lime
+python-multipart
