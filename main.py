@@ -69,11 +69,14 @@ def gradcam_images(img_array, heatmap, alpha=0.4):
 def lime_predict_fn(images):
     images = np.asarray(images, dtype=np.float32)
     outs = []
-    for i in range(0, len(images), 8):
-        outs.append(model(images[i:i + 8], training=False).numpy())
+    # মেমোরি বাঁচাতে ব্যাচ সাইজ ২ করা হয়েছে
+    for i in range(0, len(images), 2):
+        batch = images[i:i + 2]
+        pred = model(batch, training=False).numpy()
+        outs.append(pred)
     return np.concatenate(outs, axis=0)
 
-def compute_lime(img_array, class_idx, num_samples=60, num_regions=5):
+def compute_lime(img_array, class_idx, num_samples=25, num_regions=5):
     explainer = lime_image.LimeImageExplainer()
     explanation = explainer.explain_instance(
         img_array.astype("double"),
@@ -81,8 +84,8 @@ def compute_lime(img_array, class_idx, num_samples=60, num_regions=5):
         labels=(class_idx,),
         top_labels=None,
         hide_color=0,
-        num_samples=num_samples,
-        batch_size=8,
+        num_samples=num_samples, # ৫১২ MB RAM-এর জন্য ২৫ টি স্যাম্পল নিরাপদ
+        batch_size=2,            # ছোট ব্যাচ
         random_seed=SEED,
     )
     temp, mask = explanation.get_image_and_mask(class_idx, positive_only=True, num_features=num_regions, hide_rest=False)
@@ -93,11 +96,11 @@ def compute_lime(img_array, class_idx, num_samples=60, num_regions=5):
     return boundaries
 
 def numpy_to_base64(img_np):
-    """Numpy অ্যারে ছবিকে Base64 String-এ রূপান্তর করে যা এন্ড্রয়েডে পাঠানো সহজ"""
+    """Numpy অ্যারে ছবিকে Base64 String-এ রূপান্তর করে"""
     img_uint8 = (img_np * 255).astype(np.uint8)
     pil_img = Image.fromarray(img_uint8)
     buff = io.BytesIO()
-    pil_img.save(buff, format="JPEG")
+    pil_img.save(buff, format="JPEG", quality=85) # ছবি সাইজ অপটিমাইজ
     return base64.b64encode(buff.getvalue()).decode("utf-8")
 
 # ---- API ENDPOINT ----
@@ -108,8 +111,8 @@ async def process_xai(file: UploadFile = File(...)):
         pil_img = Image.open(io.BytesIO(contents))
         resized_img, img_array = preprocess(pil_img)
 
-        # ১. প্রেডিকশন
-        probs = model.predict(img_array[None, ...], verbose=0)[0]
+        # ১. প্রেডিকশন (মেমোরি সেভ করতে training=False ব্যবহার করা হয়েছে)
+        probs = model(img_array[None, ...], training=False).numpy()[0]
         pred_index = int(np.argmax(probs))
         class_name = CLASS_NAMES[pred_index].replace("_", " ").title()
         confidence = float(100 * probs[pred_index])
@@ -119,9 +122,13 @@ async def process_xai(file: UploadFile = File(...)):
         overlay = gradcam_images(img_array, heatmap)
         gradcam_b64 = numpy_to_base64(overlay)
 
-        # ৩. LIME জেনারেট
-        lime_boundaries = compute_lime(img_array, pred_index, num_samples=60, num_regions=5)
+        # ৩. LIME জেনারেট (num_samples=25 দিয়ে মেমোরি ক্র্যাশ ঠেকানো হয়েছে)
+        lime_boundaries = compute_lime(img_array, pred_index, num_samples=25, num_regions=5)
         lime_b64 = numpy_to_base64(lime_boundaries)
+
+        # গার্বেজ কালেকশন
+        del img_array, heatmap, overlay, lime_boundaries
+        gc.collect()
 
         return JSONResponse(content={
             "status": "success",
@@ -131,4 +138,5 @@ async def process_xai(file: UploadFile = File(...)):
             "lime_image": lime_b64
         })
     except Exception as e:
+        gc.collect()
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
